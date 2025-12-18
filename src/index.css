@@ -1,0 +1,20 @@
+/* src/styles/map.css */
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+.map-container {
+  height: 100vh;
+  width: 100vw;
+}
+.sidebar {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  background: white;
+  padding: 10px;
+  z-index: 1000;
+  border-radius: 5px;
+  max-width: 300px;
+}
