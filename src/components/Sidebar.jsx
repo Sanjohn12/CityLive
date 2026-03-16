@@ -1,10 +1,15 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, memo } from "react";
 import AccessibilityGraph from "./AccessibilityGraph";
 import axios from "axios";
 
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 const GEMINI_MODEL = "gemini-2.5-flash-lite";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+// In production (Netlify), we call our secure proxy function at /api/gemini-proxy
+// to protect the API key. Locally, we can call the API directly for development convenience.
+const IS_LOCAL = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+const PROXY_URL = "/api/gemini-proxy";
+const DIRECT_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
 // --- PROVINCE LIST ---
 const PROVINCES = [
@@ -26,7 +31,7 @@ const PROVINCES = [
   "Thüringen",
 ];
 
-function ServiceCategory({ name, data, color, isCustomMode, customWeight, onWeightChange }) {
+const ServiceCategory = React.memo(({ name, data, color, isCustomMode, customWeight, onWeightChange }) => {
   const [expanded, setExpanded] = useState(false);
   const handleToggle = (e) => {
     if (e && e.stopPropagation) e.stopPropagation();
@@ -39,6 +44,7 @@ function ServiceCategory({ name, data, color, isCustomMode, customWeight, onWeig
         marginBottom: "8px",
         border: "1px solid #f1f5f9",
         borderRadius: "8px",
+        background: "#fff",
       }}
       onClick={(e) => e.stopPropagation()}
     >
@@ -134,7 +140,8 @@ function ServiceCategory({ name, data, color, isCustomMode, customWeight, onWeig
       )}
     </div>
   );
-}
+});
+
 
 function HeatmapLegend() {
   const gradient =
@@ -185,6 +192,58 @@ function HeatmapLegend() {
   );
 }
 
+function LandUseLegend() {
+  const gradient =
+    "linear-gradient(to right, #2b83ba, #abdda4, #ffffbf, #fdae61, #d7191c)";
+  return (
+    <div
+      style={{
+        padding: "12px",
+        background: "#f8fafc",
+        borderRadius: "8px",
+        border: "1px solid #e2e8f0",
+        marginBottom: "15px",
+      }}
+    >
+      <div
+        style={{
+          fontSize: "0.65rem",
+          fontWeight: "800",
+          color: "#475569",
+          marginBottom: "8px",
+          letterSpacing: "0.05em",
+        }}
+      >
+        LAND USE MIX GRADIENT
+      </div>
+      <div
+        style={{
+          height: "10px",
+          width: "100%",
+          background: gradient,
+          borderRadius: "4px",
+          marginBottom: "5px",
+        }}
+      />
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          fontSize: "0.6rem",
+          color: "#64748b",
+          fontWeight: "bold",
+        }}
+      >
+        <span>0.03</span>
+        <span>0.23</span>
+        <span>0.43</span>
+        <span>0.63</span>
+        <span>0.84</span>
+      </div>
+    </div>
+  );
+}
+
 const formatReviewText = (text) => {
   if (!text) return null;
   const parts = text.split(/(\*\*.*?\*\*)/g);
@@ -200,7 +259,7 @@ const formatReviewText = (text) => {
   });
 };
 
-function RankCard({ rank, result, categoryColors }) {
+const RankCard = React.memo(({ rank, result, categoryColors }) => {
   const [isExpanded, setIsExpanded] = useState(false);
   const isWinner = rank === 0;
   return (
@@ -262,7 +321,8 @@ function RankCard({ rank, result, categoryColors }) {
       )}
     </div>
   );
-}
+});
+
 
 export default function SideBar({
   accessibilityScore,
@@ -295,97 +355,130 @@ export default function SideBar({
   isCustomWeightMode,
   setIsCustomWeightMode,
   onWeightChange,
+  showLandUseMix,
+  onToggleLandUseMix,
+  showPois,
+  onTogglePois,
 }) {
   const [showBreakdown, setShowBreakdown] = useState(false);
+  const [darkMode, setDarkMode] = useState(false);
   const [coords, setCoords] = useState("");
   const [aiReview, setAiReview] = useState("");
   const [batchAiReview, setBatchAiReview] = useState("");
   const [isAiLoading, setIsAiLoading] = useState(false);
   const [isBatchAiLoading, setIsBatchAiLoading] = useState(false);
+  const isAiProcessingRef = useRef(false); // Locking ref to prevent 429
 
   const callGemini = async (messages) => {
-    const response = await axios.post(
-      GEMINI_URL,
-      {
-        contents: messages.map(m => ({
-          role: m.role === "assistant" ? "model" : "user",
-          parts: [{ text: m.content }]
-        }))
-      },
-      { headers: { "Content-Type": "application/json" } }
-    );
-    return response.data.candidates[0].content.parts[0].text;
+    const contents = messages.map(m => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content }]
+    }));
+
+    // Choose URL based on environment
+    const url = IS_LOCAL && GEMINI_API_KEY ? DIRECT_URL : PROXY_URL;
+
+    try {
+      const response = await axios.post(
+        url,
+        { contents },
+        { headers: { "Content-Type": "application/json" } }
+      );
+
+      return response.data.candidates[0].content.parts[0].text;
+    } catch (err) {
+      console.error("FULL AI ERROR:", err);
+      if (err.response) {
+        console.error("ERROR DATA:", err.response.data);
+        console.error("ERROR STATUS:", err.response.status);
+      }
+      // If proxy fails and we're local, try direct as backup
+      if (!IS_LOCAL && url === PROXY_URL) {
+        console.error("CRITICAL: Netlify Proxy is unreachable or failing. Check Netlify function logs.");
+      }
+      throw err;
+    }
   };
 
   useEffect(() => {
     const fetchAiInsight = async () => {
-      if (markerPos && !isBatchMode) {
-        setIsAiLoading(true);
-        setAiReview(""); // Clear previous review
-        try {
-          const categories = Object.entries(serviceDistribution)
-            .map(([name, data]) => `${name}: ${data.total} services`)
-            .join(", ");
+      // SECURITY LOCK: Prevent multiple requests if one is in flight or we are in batch mode
+      if (!markerPos || isBatchMode || isAiProcessingRef.current) return;
+      if (!accessibilityScore || Object.keys(serviceDistribution).length === 0) return;
 
-          const prompt = `You are a professional Urban Planner. Analyze this 15-minute city accessibility data for coordinates [${markerPos.lat}, ${markerPos.lng}]:
-          - Accessibility Score: ${accessibilityScore}%
-          - Service Distribution: ${categories}
-          
-          1. Provide a concise analysis (max 3 sentences) of livability. 
-          2. Identify the 'Most Suitable Persona' (e.g. Young Families, Students, Professionals, Retirees).
-          3. Suggest 2 infrastructure improvements.
+      setIsAiLoading(true);
+      setAiReview("");
+      isAiProcessingRef.current = true; // LOCK ON
 
-          IMPORTANT: Return the data as a JSON block at the end like this:
-          JSON_START
-          {
-            "persona": "Persona Name",
-            "persona_reason": "One sentence why",
-            "recommendations": [{"lat": L1, "lng": G1, "type": "Type", "reason": "Reason"}]
-          }
-          JSON_END
-          Use markdown bolding for the text analysis.`;
+      try {
+        const categories = Object.entries(serviceDistribution)
+          .map(([name, data]) => `${name}: ${data.total} services`)
+          .join(", ");
 
-          const content = await callGemini([{ role: "user", content: prompt }]);
+        const prompt = `You are a professional Urban Planner. Analyze this 15-minute city accessibility data for coordinates [${markerPos.lat}, ${markerPos.lng}]:
+        - Accessibility Score: ${accessibilityScore}%
+        - Service Distribution: ${categories}
+        
+        1. Provide a concise analysis (max 3 sentences) of livability. 
+        2. Identify the 'Most Suitable Persona' (e.g. Young Families, Students, Professionals, Retirees).
+        3. Suggest 2 infrastructure improvements.
 
-          const jsonMatch = content.match(/JSON_START([\s\S]*?)JSON_END/);
-          let cleanText = content.replace(/JSON_START[\s\S]*?JSON_END/, "").trim();
-
-          setAiReview(cleanText);
-
-          if (jsonMatch) {
-            try {
-              const data = JSON.parse(jsonMatch[1]);
-              if (data.recommendations) onAiRecommendations(data.recommendations);
-              if (data.persona && onPersonaUpdate) {
-                onPersonaUpdate({
-                  name: data.persona,
-                  reason: data.persona_reason,
-                  lat: markerPos.lat,
-                  lng: markerPos.lng
-                });
-              }
-            } catch (e) {
-              console.error("Failed to parse AI data", e);
-            }
-          }
-        } catch (error) {
-          console.error("AI Insight Error:", error);
-          setAiReview("⚠️ AI Error: Failed to analyze area.");
-        } finally {
-          setIsAiLoading(false);
+        IMPORTANT: Return the data as a JSON block at the end like this:
+        JSON_START
+        {
+          "persona": "Persona Name",
+          "persona_reason": "One sentence why",
+          "recommendations": [{"lat": L1, "lng": G1, "type": "Type", "reason": "Reason"}]
         }
+        JSON_END
+        Use markdown bolding for the text analysis.`;
+
+        const content = await callGemini([{ role: "user", content: prompt }]);
+
+        const jsonMatch = content.match(/JSON_START([\s\S]*?)JSON_END/);
+        let cleanText = content.replace(/JSON_START[\s\S]*?JSON_END/, "").trim();
+
+        setAiReview(cleanText);
+
+        if (jsonMatch) {
+          try {
+            const data = JSON.parse(jsonMatch[1]);
+            if (data.recommendations) onAiRecommendations(data.recommendations);
+            if (data.persona && onPersonaUpdate) {
+              onPersonaUpdate({
+                name: data.persona,
+                reason: data.persona_reason,
+                lat: markerPos.lat,
+                lng: markerPos.lng
+              });
+            }
+          } catch (e) {
+            console.error("Failed to parse AI JSON", e);
+          }
+        }
+      } catch (error) {
+        console.error("AI Insight Error:", error);
+        if (error.response?.status === 429) {
+          setAiReview("⚠️ AI Limit Reached: Please wait a moment before trying again.");
+        } else {
+          setAiReview("⚠️ AI Error: Failed to analyze area. Check your connection.");
+        }
+      } finally {
+        setIsAiLoading(false);
+        isAiProcessingRef.current = false; // LOCK OFF
       }
     };
 
-    const timer = setTimeout(fetchAiInsight, 1000);
+    const timer = setTimeout(fetchAiInsight, 2000); // Increased safety debounce to 2000ms
     return () => clearTimeout(timer);
   }, [accessibilityScore, serviceDistribution, isBatchMode, markerPos]);
 
   useEffect(() => {
     const fetchBatchAiInsight = async () => {
-      if (isBatchMode && batchResults.length > 0) {
+      if (isBatchMode && batchResults.length > 0 && !isAiProcessingRef.current) {
         setIsBatchAiLoading(true);
         setBatchAiReview("");
+        isAiProcessingRef.current = true; // LOCK ON
         try {
           const locationData = batchResults.map((r, i) =>
             `Location #${i + 1}: Score ${r.score}%, Coords [${r.coords.lat.toFixed(4)}, ${r.coords.lng.toFixed(4)}]`
@@ -404,14 +497,19 @@ export default function SideBar({
           setBatchAiReview(content);
         } catch (error) {
           console.error("Batch AI Error:", error);
-          setBatchAiReview("⚠️ Failed to generate comparative analysis.");
+          if (error.response?.status === 429) {
+            setBatchAiReview("⚠️ AI Limit Reached: Comparative analysis is temporarily unavailable.");
+          } else {
+            setBatchAiReview("⚠️ Failed to generate comparative analysis. Please try again.");
+          }
         } finally {
           setIsBatchAiLoading(false);
+          isAiProcessingRef.current = false; // LOCK OFF
         }
       }
     };
 
-    const timer = setTimeout(fetchBatchAiInsight, 1500);
+    const timer = setTimeout(fetchBatchAiInsight, 2500); // Increased safety debounce to 2500ms
     return () => clearTimeout(timer);
   }, [isBatchMode, batchResults]);
 
@@ -422,8 +520,21 @@ export default function SideBar({
           from { opacity: 0; transform: translateY(20px); }
           to { opacity: 1; transform: translateY(0); }
         }
+        @keyframes ringFill {
+          from { stroke-dashoffset: 326; }
+          to { stroke-dashoffset: var(--ring-offset); }
+        }
+        @keyframes shimmer {
+          0% { background-position: -400px 0; }
+          100% { background-position: 400px 0; }
+        }
         .premium-card {
           animation: slideUpFade 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+          transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .premium-card:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 8px 20px rgba(0,0,0,0.08) !important;
         }
         .insight-box {
           animation: slideUpFade 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
@@ -439,6 +550,23 @@ export default function SideBar({
           letter-spacing: 0.5px;
           box-shadow: 0 2px 4px rgba(16, 185, 129, 0.2);
         }
+        .ctrl-btn {
+          transition: transform 0.15s ease, box-shadow 0.15s ease, filter 0.15s ease;
+        }
+        .ctrl-btn:hover {
+          transform: translateY(-1px);
+          box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+          filter: brightness(1.08);
+        }
+        .ctrl-btn:active {
+          transform: scale(0.97);
+        }
+        .skeleton {
+          background: linear-gradient(90deg, #e2e8f0 25%, #f1f5f9 50%, #e2e8f0 75%);
+          background-size: 800px 100%;
+          animation: shimmer 1.4s infinite linear;
+          border-radius: 6px;
+        }
       `}</style>
       <div
         className="glass-sidebar"
@@ -448,38 +576,74 @@ export default function SideBar({
           flexDirection: "column",
           height: "100vh",
           fontFamily: "'Inter', sans-serif",
+          background: darkMode ? "#0f172a" : "#fff",
+          color: darkMode ? "#e2e8f0" : "#0f172a",
+          transition: "background 0.3s ease, color 0.3s ease",
         }}
       >
+        {/* ── Premium Branding Header ── */}
         <div
           style={{
-            padding: "15px",
-            background: "#0f172a",
+            padding: "18px 16px",
+            background: "linear-gradient(135deg, #0f172a 0%, #1e293b 60%, #1e3a5f 100%)",
             color: "#fff",
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
+            borderBottom: "1px solid rgba(255,255,255,0.07)",
+            boxShadow: "0 4px 20px rgba(0,0,0,0.25)",
           }}
         >
-          <b style={{ fontSize: "0.8rem", letterSpacing: "1px" }}>
-            CITY ANALYST v2.0
-          </b>
-          {isIsochroneActive && (
+          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+            <div style={{
+              width: 32, height: 32, borderRadius: "10px",
+              background: "linear-gradient(135deg, #6366f1, #3b82f6)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: "1rem", boxShadow: "0 4px 12px rgba(99,102,241,0.4)"
+            }}>🗺️</div>
+            <div>
+              <div style={{
+                fontWeight: "900", fontSize: "0.85rem", letterSpacing: "0.5px",
+                background: "linear-gradient(90deg, #fff, #93c5fd)",
+                WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent"
+              }}>CITY ANALYST</div>
+              <div style={{ fontSize: "0.6rem", color: "rgba(255,255,255,0.45)", letterSpacing: "0.8px", marginTop: "1px" }}>
+                15-MINUTE CITY INTELLIGENCE
+              </div>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
             <button
-              onClick={onReset}
+              onClick={() => setDarkMode(d => !d)}
+              title={darkMode ? "Light mode" : "Dark mode"}
               style={{
-                background: "#ef4444",
-                color: "#fff",
-                border: "none",
-                fontSize: "0.6rem",
-                padding: "4px 8px",
-                borderRadius: "4px",
-                cursor: "pointer",
-                fontWeight: "bold",
+                background: "rgba(255,255,255,0.1)",
+                border: "1px solid rgba(255,255,255,0.15)",
+                borderRadius: "8px", color: "#fff",
+                fontSize: "0.75rem", padding: "5px 8px",
+                cursor: "pointer", transition: "all 0.2s ease",
               }}
-            >
-              RESET
-            </button>
-          )}
+            >{darkMode ? "☀️" : "🌙"}</button>
+            {isIsochroneActive && (
+              <button
+                onClick={onReset}
+                style={{
+                  background: "rgba(239,68,68,0.2)",
+                  color: "#fca5a5",
+                  border: "1px solid rgba(239,68,68,0.3)",
+                  fontSize: "0.6rem",
+                  padding: "5px 10px",
+                  borderRadius: "6px",
+                  cursor: "pointer",
+                  fontWeight: "bold",
+                  letterSpacing: "0.5px",
+                  transition: "all 0.2s ease",
+                }}
+              >
+                ✕ RESET
+              </button>
+            )}
+          </div>
         </div>
 
         <div style={{ flex: 1, overflowY: "auto", padding: "15px" }}>
@@ -502,34 +666,35 @@ export default function SideBar({
                 disabled={isLoadingProvince}
                 style={{
                   width: "100%",
-                  padding: "10px",
-                  borderRadius: "8px",
-                  border: "2px solid #e2e8f0",
+                  padding: "10px 36px 10px 12px",
+                  borderRadius: "10px",
+                  border: `2px solid ${darkMode ? "#334155" : "#e2e8f0"}`,
                   fontSize: "0.85rem",
                   appearance: "none",
                   cursor: "pointer",
-                  background: isLoadingProvince ? "#f1f5f9" : "#fff",
+                  background: darkMode ? "#1e293b" : (isLoadingProvince ? "#f1f5f9" : "#fff"),
+                  color: darkMode ? "#e2e8f0" : "#0f172a",
+                  fontFamily: "'Inter', sans-serif",
+                  fontWeight: "500",
+                  transition: "border-color 0.2s ease",
+                  outline: "none",
+                  opacity: isLoadingProvince ? 0.6 : 1,
                 }}
               >
                 {PROVINCES.map((p) => (
-                  <option key={p} value={p}>
-                    {p}
-                  </option>
+                  <option key={p} value={p}>{p}</option>
                 ))}
               </select>
+              <span style={{
+                position: "absolute", right: "12px", top: "50%",
+                transform: "translateY(-50%)", pointerEvents: "none",
+                color: darkMode ? "#94a3b8" : "#64748b", fontSize: "0.7rem"
+              }}>▼</span>
               {isLoadingProvince && (
-                <div
-                  style={{
-                    position: "absolute",
-                    right: "10px",
-                    top: "50%",
-                    transform: "translateY(-50%)",
-                    fontSize: "0.7rem",
-                    color: "#3b82f6",
-                    fontWeight: "bold",
-                  }}
-                >
-                  LOADING...
+                <div style={{ marginTop: "8px", display: "flex", flexDirection: "column", gap: "6px" }}>
+                  <div className="skeleton" style={{ height: 12, width: "80%" }} />
+                  <div className="skeleton" style={{ height: 12, width: "60%" }} />
+                  <div className="skeleton" style={{ height: 12, width: "70%" }} />
                 </div>
               )}
             </div>
@@ -579,6 +744,7 @@ export default function SideBar({
           </div>
 
           {isKdeVisible && <HeatmapLegend />}
+          {showLandUseMix && <LandUseLegend />}
 
           {isIsochroneActive && !isBatchMode && (
             <div
@@ -779,27 +945,35 @@ export default function SideBar({
           {!isBatchMode
             ? isIsochroneActive && (
               <div style={{ textAlign: "center" }}>
-                <div
-                  style={{
-                    fontSize: "0.65rem",
-                    fontWeight: "bold",
-                    color: "#94a3b8",
-                  }}
-                >
+                {/* ── Animated Score Ring ── */}
+                <div style={{ fontSize: "0.65rem", fontWeight: "800", color: "#94a3b8", letterSpacing: "1px", marginBottom: "8px" }}>
                   ACCESSIBILITY SCORE
                 </div>
-                <h1
-                  className="score-value"
-                  style={{
-                    fontSize: "4rem",
-                    margin: "0",
-                    color: accessibilityScore > 60 ? "#10b981" : "#ef4444",
-                    fontWeight: "800",
-                    textShadow: "0 2px 10px rgba(0,0,0,0.1)",
-                  }}
-                >
-                  {accessibilityScore}%
-                </h1>
+                {(() => {
+                  const r = 52;
+                  const circ = 2 * Math.PI * r;
+                  const offset = circ - (accessibilityScore / 100) * circ;
+                  const color = accessibilityScore >= 70 ? "#10b981" : accessibilityScore >= 45 ? "#f59e0b" : "#ef4444";
+                  return (
+                    <div style={{ position: "relative", display: "inline-flex", alignItems: "center", justifyContent: "center", marginBottom: "8px" }}>
+                      <svg width="130" height="130" style={{ transform: "rotate(-90deg)" }}>
+                        <circle cx="65" cy="65" r={r} fill="none" stroke={darkMode ? "#1e293b" : "#f1f5f9"} strokeWidth="10" />
+                        <circle
+                          cx="65" cy="65" r={r} fill="none"
+                          stroke={color} strokeWidth="10"
+                          strokeLinecap="round"
+                          strokeDasharray={circ}
+                          strokeDashoffset={offset}
+                          style={{ transition: "stroke-dashoffset 1s cubic-bezier(0.4,0,0.2,1), stroke 0.5s ease" }}
+                        />
+                      </svg>
+                      <div style={{ position: "absolute", textAlign: "center" }}>
+                        <div style={{ fontSize: "2rem", fontWeight: "900", color, lineHeight: 1 }}>{accessibilityScore}</div>
+                        <div style={{ fontSize: "0.6rem", color: "#94a3b8", fontWeight: "700", letterSpacing: "0.5px" }}>/ 100</div>
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 <AccessibilityGraph serviceDistribution={serviceDistribution} />
 
@@ -820,52 +994,36 @@ export default function SideBar({
                 </button>
 
                 {showBreakdown && (
-                  <div
-                    style={{
-                      background: "#f1f5f9",
-                      padding: "12px",
-                      borderRadius: "8px",
-                      textAlign: "left",
-                      fontSize: "0.75rem",
-                      marginBottom: "20px",
-                      border: "1px dashed #cbd5e1",
-                    }}
-                  >
-                    <div
-                      style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        marginBottom: "4px",
-                      }}
-                    >
-                      <span>🏙️ Urban Density (40%)</span>{" "}
-                      <strong>
-                        {Math.min(40, accessibilityScore * 0.4).toFixed(0)}%
-                      </strong>
-                    </div>
-                    <div
-                      style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                        marginBottom: "4px",
-                      }}
-                    >
-                      <span>📦 Service Volume (30%)</span>{" "}
-                      <strong>
-                        {Math.min(30, accessibilityScore * 0.3).toFixed(0)}%
-                      </strong>
-                    </div>
-                    <div
-                      style={{
-                        display: "flex",
-                        justifyContent: "space-between",
-                      }}
-                    >
-                      <span>🌈 Category Diversity (30%)</span>{" "}
-                      <strong>
-                        {Math.min(30, accessibilityScore * 0.3).toFixed(0)}%
-                      </strong>
-                    </div>
+                  <div style={{
+                    background: darkMode ? "#1e293b" : "#f8fafc",
+                    padding: "14px",
+                    borderRadius: "12px",
+                    textAlign: "left",
+                    fontSize: "0.75rem",
+                    marginBottom: "20px",
+                    border: `1px solid ${darkMode ? "#334155" : "#e2e8f0"}`,
+                    animation: "slideUpFade 0.4s ease forwards",
+                  }}>
+                    {[
+                      { label: "🏙️ Urban Density", pct: 40, val: Math.min(40, accessibilityScore * 0.4), color: "#6366f1" },
+                      { label: "📦 Service Volume", pct: 30, val: Math.min(30, accessibilityScore * 0.3), color: "#3b82f6" },
+                      { label: "🌈 Category Diversity", pct: 30, val: Math.min(30, accessibilityScore * 0.3), color: "#10b981" },
+                    ].map(({ label, pct, val, color }) => (
+                      <div key={label} style={{ marginBottom: "12px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "4px" }}>
+                          <span style={{ color: darkMode ? "#cbd5e1" : "#475569", fontWeight: "600" }}>{label} ({pct}%)</span>
+                          <strong style={{ color }}>{val.toFixed(1)} pts</strong>
+                        </div>
+                        <div style={{ height: "6px", background: darkMode ? "#334155" : "#e2e8f0", borderRadius: "99px", overflow: "hidden" }}>
+                          <div style={{
+                            height: "100%", width: `${(val / pct) * 100}%`,
+                            background: `linear-gradient(90deg, ${color}99, ${color})`,
+                            borderRadius: "99px",
+                            transition: "width 1s cubic-bezier(0.4,0,0.2,1)",
+                          }} />
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 )}
 
@@ -932,60 +1090,42 @@ export default function SideBar({
             ))}
         </div>
 
-        <div
-          style={{
-            padding: "15px",
-            borderTop: "1px solid #eee",
-            display: "flex",
-            flexDirection: "column",
-            gap: "8px",
-            background: "#f8fafc",
-          }}
-        >
-          <button
-            onClick={onToggleBoundaries}
-            style={{
-              padding: "10px",
-              background: showProvinceBoundaries ? "#10b981" : "#fff",
-              color: showProvinceBoundaries ? "#fff" : "#475569",
-              border: "1px solid #cbd5e1",
-              borderRadius: "8px",
-              fontSize: "0.7rem",
-              fontWeight: "bold",
-              cursor: "pointer",
-            }}
-          >
-            {showProvinceBoundaries ? "HIDE GERMANY MAP" : "SHOW GERMANY MAP"}
-          </button>
-          <button
-            onClick={onToggleGrid}
-            style={{
-              padding: "10px",
-              background: showGrid ? "#8b5cf6" : "#fff",
-              color: showGrid ? "#fff" : "#475569",
-              border: "1px solid #cbd5e1",
-              borderRadius: "8px",
-              fontSize: "0.7rem",
-              fontWeight: "bold",
-              cursor: "pointer",
-            }}
-          >
-            {showGrid ? "DISABLE GRID" : "ENABLE GRID"}
-          </button>
-          <button
-            onClick={onToggleKdePalette}
-            style={{
-              padding: "10px",
-              background: isKdeVisible ? "#ef4444" : "#0f172a",
-              color: "#fff",
-              border: "none",
-              borderRadius: "8px",
-              fontWeight: "bold",
-              cursor: "pointer",
-            }}
-          >
-            {isKdeVisible ? "HIDE HEATMAP" : "SHOW HEATMAP OVERLAY"}
-          </button>
+        <div style={{
+          padding: "14px",
+          borderTop: `1px solid ${darkMode ? "#1e293b" : "#e2e8f0"}`,
+          display: "flex",
+          flexDirection: "column",
+          gap: "7px",
+          background: darkMode ? "#0f172a" : "#f8fafc",
+        }}>
+          {[
+            { label: showProvinceBoundaries ? "🗺️ Hide Germany Map" : "🗺️ Show Germany Map", onClick: onToggleBoundaries, active: showProvinceBoundaries, activeColor: "#10b981" },
+            { label: showGrid ? "⊞ Disable Grid" : "⊞ Enable Grid", onClick: onToggleGrid, active: showGrid, activeColor: "#8b5cf6" },
+            { label: showLandUseMix ? "🟡 Hide Land Use Mix" : "🟡 Show Land Use Mix", onClick: onToggleLandUseMix, active: showLandUseMix, activeColor: "#f59e0b" },
+            { label: showPois ? "📍 Hide POIs" : "📍 Show POIs", onClick: onTogglePois, active: showPois, activeColor: "#0ea5e9" },
+            { label: isKdeVisible ? "🔥 Hide Heatmap" : "🔥 Show Heatmap Overlay", onClick: onToggleKdePalette, active: isKdeVisible, activeColor: "#ef4444", alwaysDark: true },
+          ].map(({ label, onClick, active, activeColor, alwaysDark }) => (
+            <button
+              key={label}
+              className="ctrl-btn"
+              onClick={onClick}
+              style={{
+                padding: "10px 14px",
+                background: active ? activeColor : (darkMode || alwaysDark ? "#1e293b" : "#fff"),
+                color: active ? "#fff" : (darkMode ? "#cbd5e1" : "#475569"),
+                border: `1px solid ${active ? activeColor : (darkMode ? "#334155" : "#e2e8f0")}`,
+                borderRadius: "10px",
+                fontSize: "0.72rem",
+                fontWeight: "700",
+                cursor: "pointer",
+                textAlign: "left",
+                letterSpacing: "0.2px",
+                boxShadow: active ? `0 4px 12px ${activeColor}33` : "none",
+              }}
+            >
+              {label}
+            </button>
+          ))}
         </div>
       </div>
     </>

@@ -24,7 +24,7 @@ const AccessibilityGraph = ({ serviceDistribution }) => {
   }));
 
   return (
-    <div style={{ width: '100%', height: 250, marginTop: '10px' }}>
+    <div style={{ width: '100%', height: 250, marginTop: '10px', minWidth: 0 }}>
       <ResponsiveContainer width="100%" height="100%">
         <RadarChart cx="50%" cy="50%" outerRadius="80%" data={data}>
           <PolarGrid stroke="#e2e8f0" />

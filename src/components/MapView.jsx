@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import parseGeoraster from "georaster";
+import georaster from "georaster";
 import {
   MapContainer,
   TileLayer,
@@ -12,7 +12,6 @@ import {
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 import L from "leaflet";
-import georaster from "georaster";
 import geoblaze from "geoblaze";
 import * as turf from "@turf/turf";
 import axios from "axios";
@@ -57,6 +56,34 @@ const getKdeColor = (val) => {
   if (val < 0.05) return "#f4e61e";
   if (val < 0.1) return "#f8961e";
   return "#d62828";
+};
+
+const getLandUseColor = (val) => {
+  if (val <= 0.0 || isNaN(val)) return "transparent";
+  if (val < 0.23) return "#2b83ba";
+  if (val < 0.43) return "#abdda4";
+  if (val < 0.63) return "#ffffbf";
+  if (val < 0.84) return "#fdae61";
+  return "#d7191c";
+};
+
+const PROVINCE_LANDMIX_MAP = {
+  "Baden-Württemberg": "Baden_LandMix_WGS84.tif",
+  "Bayern": "Bayern_LandMix_WGS84.tif",
+  "Berlin": "Land_Use_Mix_Grid_Berlin_WGS84.tif",
+  "Brandenburg": "BrendenBerg_Land_Use_Mix_Grid_WGS84.tif",
+  "Bremen": "Bermen_LandMix_WGS84.tif",
+  "Hamburg": "Hamburg_LandMix_WGS84.tif",
+  "Hessen": "Hessen_LandMix_WGS84.tif",
+  "Mecklenburg-Vorpommern": "Mecklenburg_LandMix_WGS84.tif",
+  "Niedersachsen": "Niedersachsen_LandMix_WGS84.tif",
+  "Nordrhein-Westfalen": "Nordrhein_LandMix_WGS84.tif",
+  "Rheinland-Pfalz": "Rheinland_Pfalz_LandMix_WGS84.tif",
+  "Saarland": "Land_Use_Mix_Grid_WGS84.tif",
+  "Sachsen": "Sachsen_LandMix_WGS84.tif",
+  "Sachsen-Anhalt": "Sachsen_Anhalt_LandMix_WGS84.tif",
+  "Schleswig-Holstein": "Schleswig_LandMix_WGS84.tif",
+  "Thüringen": "Thüringen_LandMix_WGS84.tif",
 };
 
 const spinnerStyles = `
@@ -111,6 +138,18 @@ const fetchIsochrone = async (latlng, travelMode, rangeValue) => {
   }
 };
 
+const isochroneCache = new Map();
+const rasterCache = new Map();
+
+async function getCachedGeoRaster(url) {
+  if (rasterCache.has(url)) return rasterCache.get(url);
+  const resp = await fetch(url);
+  const buf = await resp.arrayBuffer();
+  const data = await georaster(buf);
+  rasterCache.set(url, data);
+  return data;
+}
+
 function SearchField({
   onLocationFound,
   setSelectedProvince,
@@ -128,7 +167,8 @@ function SearchField({
     })
       .on("markgeocode", async (e) => {
         const { center } = e.geocode;
-        map.flyTo(center, 15, { animate: true, duration: 1.5 });
+        // FAST: reduce animation duration
+        map.flyTo(center, 15, { animate: true, duration: 0.6 });
         try {
           const res = await axios.get(
             `https://nominatim.openstreetmap.org/reverse?format=json&lat=${center.lat}&lon=${center.lng}&zoom=5`,
@@ -153,7 +193,7 @@ function MapController({ batchResults, isBatchMode, provinceData }) {
   useEffect(() => {
     if (isBatchMode && batchResults.length > 0) {
       const best = batchResults[0].coords;
-      map.flyTo([best.lat, best.lng], 14, { animate: true, duration: 1.5 });
+      map.flyTo([best.lat, best.lng], 14, { animate: true, duration: 0.6 });
     }
   }, [batchResults, isBatchMode, map]);
 
@@ -165,42 +205,79 @@ function MapController({ batchResults, isBatchMode, provinceData }) {
           [bbox[1], bbox[0]],
           [bbox[3], bbox[2]],
         ],
-        { padding: [20, 20], animate: true, duration: 1.5 },
+        { padding: [20, 20], animate: true, duration: 0.6 },
       );
     }
   }, [provinceData, map]);
   return null;
 }
 
-function SafeRasterLayer({ georasterData, visible }) {
+// SINGLE OVERLAY CONTROLLER — one layer at a time, synchronous swap, zero race conditions.
+const OverlayController = React.memo(({ activeOverlay, fullKdeRaster, landUseRaster }) => {
   const map = useMap();
   const layerRef = useRef(null);
+  const generationRef = useRef(0); // increments on every overlay switch
+
   useEffect(() => {
+    // Bump the generation — any tile callbacks still running from the OLD layer
+    // will see a stale generation and paint transparent instead, killing ghost tiles.
+    const generation = ++generationRef.current;
+
+    // Step 1: Destroy the current active layer immediately and synchronously
     if (layerRef.current) {
-      map.removeLayer(layerRef.current);
+      if (map.hasLayer(layerRef.current)) {
+        map.removeLayer(layerRef.current);
+      }
       layerRef.current = null;
     }
-    if (visible && georasterData) {
-      try {
-        layerRef.current = new GeoRasterLayer({
-          georaster: georasterData,
-          opacity: 0.6,
-          pixelValuesToColorFn: (v) => getKdeColor(v[0]),
-          resolution: 128,
-        });
-        layerRef.current.addTo(map);
-      } catch (err) {
-        console.error("Raster Error:", err);
-      }
-    }
-    return () => {
-      if (layerRef.current) map.removeLayer(layerRef.current);
-    };
-  }, [georasterData, visible, map]);
-  return null;
-}
 
-function GridLayer({ visible, servicePoints, onGridSelect }) {
+    // Step 2: Also scan and nuke any stray raster layers that may have leaked
+    map.eachLayer((l) => {
+      if (l.options && l.options.georaster) {
+        try { map.removeLayer(l); } catch (_) { }
+      }
+    });
+
+    // Step 3: Determine which data and color function to use
+    const data = activeOverlay === 'kde' ? fullKdeRaster
+      : activeOverlay === 'landuse' ? landUseRaster
+        : null;
+    const colorFn = activeOverlay === 'kde' ? getKdeColor : getLandUseColor;
+
+    if (!data) return;
+
+    // Step 4: Build and add the ONE correct layer, guarded by generation
+    try {
+      const layer = new GeoRasterLayer({
+        georaster: data,
+        opacity: 0.65,
+        pixelValuesToColorFn: (v) => {
+          // If the overlay has been switched again since this layer was created,
+          // return transparent so stale in-flight tiles don't ghost on screen.
+          if (generationRef.current !== generation) return 'transparent';
+          return colorFn(v[0]);
+        },
+        resolution: 96, // Optimistic reduction for speed
+      });
+      layer.addTo(map);
+      layerRef.current = layer;
+    } catch (err) {
+      console.error("Raster render error:", err);
+    }
+
+    return () => {
+      if (layerRef.current && map.hasLayer(layerRef.current)) {
+        map.removeLayer(layerRef.current);
+        layerRef.current = null;
+      }
+    };
+  }, [activeOverlay, fullKdeRaster, landUseRaster, map]);
+
+  return null;
+});
+
+
+const GridLayer = React.memo(({ visible, servicePoints, onGridSelect }) => {
   const [gridPoints, setGridPoints] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const map = useMap();
@@ -249,7 +326,7 @@ function GridLayer({ visible, servicePoints, onGridSelect }) {
       } finally {
         setIsLoading(false);
       }
-    }, 200);
+    }, 100); // Shorter debounce
   }, [visible, map]);
 
   useMapEvents({ moveend: refreshGrid, zoomend: refreshGrid });
@@ -286,7 +363,8 @@ function GridLayer({ visible, servicePoints, onGridSelect }) {
       ))}
     </>
   );
-}
+});
+
 
 const runSpatialAnalysis = (geometry, servicePoints, fullKdeRaster, customWeights = {}, isCustomWeightMode = false, sandboxPoints = []) => {
   if (!geometry || !servicePoints?.features || !fullKdeRaster)
@@ -394,13 +472,23 @@ function MapClickHandler({
   gridActive,
 }) {
   const map = useMap();
+  const isFetchingRef = useRef(false);
+
   useMapEvents({
     click: async (e) => {
-      if (isBatchMode || gridActive) return;
-      map.flyTo(e.latlng, 14, { animate: true, duration: 1.5 });
+      if (isBatchMode || gridActive || isFetchingRef.current) return;
+      
+      // PARALLEL: Start both map move and data fetch
+      map.flyTo(e.latlng, 14, { animate: true, duration: 0.6 });
       setMarkerPos(e.latlng);
-      const geometry = await fetchIsochrone(e.latlng, travelMode, rangeValue);
-      onIsochrone(geometry);
+      
+      isFetchingRef.current = true;
+      try {
+        const geometry = await fetchIsochrone(e.latlng, travelMode, rangeValue);
+        onIsochrone(geometry);
+      } finally {
+        isFetchingRef.current = false;
+      }
     },
   });
   return null;
@@ -411,8 +499,9 @@ export default function MapView() {
   const [fullKdeRaster, setFullKdeRaster] = useState(null);
   const [isochrone, setIsochrone] = useState(null);
   const [batchResults, setBatchResults] = useState([]);
-  const [showKde, setShowKde] = useState(false);
+  const [activeOverlay, setActiveOverlay] = useState(null); // 'kde', 'landuse', null
   const [showGrid, setShowGrid] = useState(false);
+  const [showPois, setShowPois] = useState(true);
   const [showProvinceBoundaries, setShowProvinceBoundaries] = useState(true);
   const [germanyGeoJson, setGermanyGeoJson] = useState(null);
   const [analysis, setAnalysis] = useState({
@@ -431,6 +520,7 @@ export default function MapView() {
   const [areaPersona, setAreaPersona] = useState(null);
   const [customWeights, setCustomWeights] = useState({});
   const [isCustomWeightMode, setIsCustomWeightMode] = useState(false);
+  const [landUseRaster, setLandUseRaster] = useState(null);
 
   const handleWeightChange = (category, weight) => {
     setCustomWeights(prev => ({
@@ -444,16 +534,13 @@ export default function MapView() {
       .then((r) => r.json())
       .then(setGermanyGeoJson);
 
-    fetch("/data/kde5.tif")
-      .then((r) => r.arrayBuffer())
-      .then((buf) => georaster(buf))
-      .then(setFullKdeRaster);
+    getCachedGeoRaster("/data/kde5.tif").then(setFullKdeRaster);
   }, []);
 
   useEffect(() => {
     if (!selectedProvince) return;
     setIsLoadingProvince(true);
-    const url = `https://spectacular-platypus-74985c.netlify.app/${encodeURIComponent(selectedProvince)}.geojson`;
+    const url = `https://jocular-lollipop-614828.netlify.app/${encodeURIComponent(selectedProvince)}.geojson`;
     fetch(url)
       .then((r) => r.json())
       .then((data) => {
@@ -467,6 +554,19 @@ export default function MapView() {
       })
       .catch(() => setIsLoadingProvince(false));
   }, [selectedProvince]);
+
+  useEffect(() => {
+    if (activeOverlay !== 'landuse' || !selectedProvince) {
+      setLandUseRaster(null);
+      return;
+    }
+    const filename = PROVINCE_LANDMIX_MAP[selectedProvince];
+    if (!filename) return;
+
+    getCachedGeoRaster(`/data/land_use_mix/${filename}`)
+      .then(setLandUseRaster)
+      .catch((err) => console.error("Land Use Mix load err:", err));
+  }, [selectedProvince, activeOverlay]);
 
   useEffect(() => {
     if (isochrone && !isBatchMode && servicePoints && fullKdeRaster) {
@@ -572,7 +672,15 @@ export default function MapView() {
             isBatchMode={isBatchMode}
             provinceData={servicePoints}
           />
-          <SafeRasterLayer georasterData={fullKdeRaster} visible={showKde} />
+
+          {/* SINGLE OVERLAY CONTROLLER: Always mounted, manages one layer at a time. 
+              No mount/unmount races — layer swap is fully synchronous inside the effect. */}
+          <OverlayController
+            activeOverlay={activeOverlay}
+            fullKdeRaster={fullKdeRaster}
+            landUseRaster={landUseRaster}
+          />
+
           <GridLayer
             visible={showGrid}
             servicePoints={servicePoints}
@@ -581,7 +689,7 @@ export default function MapView() {
               if (center) setMarkerPos(center);
             }}
           />
-          <FastPointLayer data={servicePoints} />
+          {showPois && <FastPointLayer data={servicePoints} />}
 
           {isochrone && !isBatchMode && (
             <GeoJSON
@@ -656,8 +764,8 @@ export default function MapView() {
           accessibilityScore: analysis.score,
           serviceDistribution: analysis.dist,
           categoryColors,
-          isKdeVisible: showKde,
-          onToggleKdePalette: () => setShowKde(!showKde),
+          isKdeVisible: activeOverlay === 'kde',
+          onToggleKdePalette: () => setActiveOverlay(activeOverlay === 'kde' ? null : 'kde'),
           showGrid,
           onToggleGrid: () => setShowGrid(!showGrid),
           showProvinceBoundaries,
@@ -685,6 +793,7 @@ export default function MapView() {
             setMarkerPos(null);
             setAiRecommendations([]);
             setAreaPersona(null);
+            setActiveOverlay(null);
           },
           onAiRecommendations: setAiRecommendations,
           onPersonaUpdate: setAreaPersona,
@@ -695,6 +804,10 @@ export default function MapView() {
           isCustomWeightMode,
           setIsCustomWeightMode,
           onWeightChange: handleWeightChange,
+          showLandUseMix: activeOverlay === 'landuse',
+          onToggleLandUseMix: () => setActiveOverlay(activeOverlay === 'landuse' ? null : 'landuse'),
+          showPois,
+          onTogglePois: () => setShowPois(!showPois),
         }}
         isIsochroneActive={!!isochrone || batchResults.length > 0}
       />
