@@ -2,8 +2,8 @@ import React, { useState, useEffect, useRef, memo } from "react";
 import AccessibilityGraph from "./AccessibilityGraph";
 import axios from "axios";
 
-const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 const GEMINI_MODEL = "gemini-2.5-flash-lite";
+const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 
 // In production (Netlify), we call our secure proxy function at /api/gemini-proxy
 // to protect the API key. Locally, we can call the API directly for development convenience.
@@ -324,7 +324,7 @@ const RankCard = React.memo(({ rank, result, categoryColors }) => {
 });
 
 
-export default function SideBar({
+export default function Sidebar({
   accessibilityScore,
   serviceDistribution,
   categoryColors,
