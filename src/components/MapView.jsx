@@ -15,7 +15,7 @@ import L from "leaflet";
 import geoblaze from "geoblaze";
 import * as turf from "@turf/turf";
 import axios from "axios";
-import Sidebar from "./Sidebar";
+import SideBar from "./Sidebar"
 import GeoRasterLayer from "georaster-layer-for-leaflet";
 
 // --- NEW SEARCH IMPORTS ---
