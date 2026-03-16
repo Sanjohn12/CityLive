@@ -477,11 +477,11 @@ function MapClickHandler({
   useMapEvents({
     click: async (e) => {
       if (isBatchMode || gridActive || isFetchingRef.current) return;
-      
+
       // PARALLEL: Start both map move and data fetch
       map.flyTo(e.latlng, 14, { animate: true, duration: 0.6 });
       setMarkerPos(e.latlng);
-      
+
       isFetchingRef.current = true;
       try {
         const geometry = await fetchIsochrone(e.latlng, travelMode, rangeValue);
